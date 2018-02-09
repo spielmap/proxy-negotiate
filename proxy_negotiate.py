@@ -1,5 +1,21 @@
+"""
+Initial version based on https://github.com/cour4g3/proxy-negotiate
+See also https://pypi.python.org/pypi/Proxy-Negotiate/1.0.0
+
+Modified by Patrick Spielmann, info@spielmann.rocks
+See https://github.com/spielmap/proxy-negotiate
+
+Modifications incorporate ideas from https://github.com/gevent/gevent/blob/master/examples/portforwarder.py
+
+2018-02-09
+-Added exception handling for socket errors
+-Added retry loop for acquiring the SPNEGO token (certain GSS-APIs causing issues here)
+
+"""
+
 import base64
 import fcntl
+import datetime
 import gevent
 import gssapi
 import os
@@ -12,17 +28,32 @@ from gevent.socket import create_connection, wait_read
 
 logger = getLogger(__name__)
 
-__version__ = '1.0.0'
+__version__ = '1.0.1'
+GET_TOKEN_NUM_RETRIES = 3
+
+
+def log(msg):
+    # TODO: Clarify, if "print" is blocking or could be used here
+    sys.stderr.write(str(datetime.datetime.now()) + " " + msg + '\n')
+    #print str(datetime.datetime.now()), msg
+
 
 def forward(src, dst):
     try:
         while True:
-            data = src.recv(1024)
+            try:
+                data = src.recv(1024)
+            except socket.error:
+                log("  ==> Could not read data from socket [%s], closing socket!" % src)
             if not data:
                 break
-            dst.sendall(data)
+            try:
+                dst.sendall(data)
+            except socket.error:
+                log("  ==> Could not send data to socket [%s], closing socket!" % dst)
     finally:
         src.close()
+
 
 def forward_stdin(sock):
     # set stdin to non-blocking so we can read available bytes
@@ -32,24 +63,36 @@ def forward_stdin(sock):
 
     try:
         while True:
-            wait_read(sys.stdin.fileno())
-            data = sys.stdin.read()
+            try:
+                wait_read(sys.stdin.fileno())
+                data = sys.stdin.read()
+            except:
+                log("  ==> Could not read data from socket [%s], closing socket!" % sock)
+
             if not data:
                 break
-            sock.sendall(data)
+            try:
+                sock.sendall(data)
+            except socket.error:
+                log("  ==> Could not send data to socket [%s], closing socket!" % sock)
     finally:
         sock.close()
+
 
 def forward_stdout(sock):
     try:
         while True:
-            data = sock.recv(1024)
+            try:
+                data = sock.recv(1024)
+            except socket.error:
+                log("  ==> Could not read data from socket [%s], closing socket!" % sock)
             if not data:
                 break
             sys.stdout.write(data)
             sys.stdout.flush()
     finally:
         sock.close()
+
 
 class NegotiateProxy(StreamServer):
     def __init__(self, listener, upstream, **kwargs):
@@ -60,15 +103,33 @@ class NegotiateProxy(StreamServer):
     def handle(self, src, addr):
         data = b''
         while True:
-            data += src.recv(1024)
+            try:
+                data += src.recv(1024)
+            except socket.error:
+                log("  ==> Could not read data from socket [%s], closing socket!" % src)
+                return
+            if not data:
+                log("  ==> Received no data from socket [%s], closing socket!" % src)
+                return
             if b'\r\n\r\n' in data:
                 break
 
         service = gssapi.Name('HTTP@%s' % self.upstream[0], gssapi.NameType.hostbased_service)
         ctx = gssapi.SecurityContext(name=service, usage='initiate')
-        token = ctx.step()
+        retry_counter = 0
+        while True:
+            try:
+                token = ctx.step()
+                break
+            except:
+                retry_counter += 1
+                log("  ==> Exception while getting Kerberos token! Number of retries [%s]" % retry_counter)
+                if retry_counter > GET_TOKEN_NUM_RETRIES:
+                    log("  ==> Retry limit reached while trying to get a Kerberos token - giving up!")
+                    return
         b64token = base64.b64encode(token).encode('ascii')
 
+        # TODO: Check if Header handling can/should be moved to the forwarder function
         headers, data = data.split(b'\r\n\r\n', 1)
         headers = headers.split('\r\n')
 
@@ -82,13 +143,23 @@ class NegotiateProxy(StreamServer):
         if not replaced:
             headers.append(b'Proxy-Authorization: Negotiate %s' % b64token)
 
-        dst = create_connection(self.upstream)
-        dst.sendall(b'\r\n'.join(headers) + b'\r\n\r\n' + data)
+        try:
+            dst = create_connection(self.upstream)
+        except:
+            log("  ==> Could not connect to upstream proxy [%s:%s]!" % self.upstream[:2])
+            return
+
+        try:
+            dst.sendall(b'\r\n'.join(headers) + b'\r\n\r\n' + data)
+        except:
+            log("  ==> Could not send data to upstream proxy [%s:%s]!" % self.upstream[:2])
+            return
 
         forwarders = (gevent.spawn(forward, src, dst),
                       gevent.spawn(forward, dst, src))
 
         gevent.joinall(forwarders)
+
 
 def netcat(host, port, proxy_host, proxy_port):
     request = [('CONNECT %s:%d HTTP/1.1' % (host, port)).encode('ascii')]
