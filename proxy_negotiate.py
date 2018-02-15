@@ -51,6 +51,7 @@ def forward(src, dst):
                 dst.sendall(data)
             except socket.error:
                 log("  ==> Could not send data to socket [%s], closing socket!" % dst)
+                break
     finally:
         src.close()
 
